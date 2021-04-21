@@ -1,90 +1,72 @@
-FROM rhel7
+FROM ubi8/s2i-core
 
-# add our user and group first to make sure their IDs get assigned consistently, regardless of whatever dependencies get added
-RUN groupadd -r mysql && useradd -r -g mysql mysql
+# MySQL image for OpenShift.
+#
+# Volumes:
+#  * /var/lib/mysql/data - Datastore for MySQL
+# Environment:
+#  * $MYSQL_USER - Database user name
+#  * $MYSQL_PASSWORD - User's password
+#  * $MYSQL_DATABASE - Name of the database to create
+#  * $MYSQL_ROOT_PASSWORD (Optional) - Password for the 'root' MySQL account
 
-RUN apt-get update && apt-get install -y --no-install-recommends gnupg dirmngr && rm -rf /var/lib/apt/lists/*
+ENV MYSQL_VERSION=8.0 \
+    APP_DATA=/opt/app-root/src \
+    HOME=/var/lib/mysql
 
-# add gosu for easy step-down from root
-# https://github.com/tianon/gosu/releases
-ENV GOSU_VERSION 1.12
-RUN set -eux; \
-	savedAptMark="$(apt-mark showmanual)"; \
-	apt-get update; \
-	apt-get install -y --no-install-recommends ca-certificates wget; \
-	rm -rf /var/lib/apt/lists/*; \
-	dpkgArch="$(dpkg --print-architecture | awk -F- '{ print $NF }')"; \
-	wget -O /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch"; \
-	wget -O /usr/local/bin/gosu.asc "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch.asc"; \
-	export GNUPGHOME="$(mktemp -d)"; \
-	gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys B42F6819007F00F88E364FD4036A9C25BF357DD4; \
-	gpg --batch --verify /usr/local/bin/gosu.asc /usr/local/bin/gosu; \
-	gpgconf --kill all; \
-	rm -rf "$GNUPGHOME" /usr/local/bin/gosu.asc; \
-	apt-mark auto '.*' > /dev/null; \
-	[ -z "$savedAptMark" ] || apt-mark manual $savedAptMark > /dev/null; \
-	apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false; \
-	chmod +x /usr/local/bin/gosu; \
-	gosu --version; \
-	gosu nobody true
+ENV SUMMARY="MySQL 8.0 SQL database server" \
+    DESCRIPTION="MySQL is a multi-user, multi-threaded SQL database server. The container \
+image provides a containerized packaging of the MySQL mysqld daemon and client application. \
+The mysqld server daemon accepts connections from clients and provides access to content from \
+MySQL databases on behalf of the clients."
 
-RUN mkdir /docker-entrypoint-initdb.d
+LABEL summary="$SUMMARY" \
+      description="$DESCRIPTION" \
+      io.k8s.description="$DESCRIPTION" \
+      io.k8s.display-name="MySQL 8.0" \
+      io.openshift.expose-services="3306:mysql" \
+      io.openshift.tags="database,mysql,mysql80,mysql-80" \
+      com.redhat.component="mysql-80-container" \
+      name="rhel8/mysql-80" \
+      version="1" \
+      com.redhat.license_terms="https://www.redhat.com/en/about/red-hat-end-user-license-agreements#rhel" \
+      usage="podman run -d -e MYSQL_USER=user -e MYSQL_PASSWORD=pass -e MYSQL_DATABASE=db -p 3306:3306 rhel8/mysql-80" \
+      maintainer="SoftwareCollections.org <sclorg@redhat.com>"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-# for MYSQL_RANDOM_ROOT_PASSWORD
-		pwgen \
-# for mysql_ssl_rsa_setup
-		openssl \
-# FATAL ERROR: please install the following Perl modules before executing /usr/local/mysql/scripts/mysql_install_db:
-# File::Basename
-# File::Copy
-# Sys::Hostname
-# Data::Dumper
-		perl \
-# install "xz-utils" for .sql.xz docker-entrypoint-initdb.d files
-		xz-utils \
-	&& rm -rf /var/lib/apt/lists/*
+EXPOSE 3306
 
-RUN set -ex; \
-# gpg: key 5072E1F5: public key "MySQL Release Engineering <mysql-build@oss.oracle.com>" imported
-	key='A4A9406876FCBD3C456770C88C718D3B5072E1F5'; \
-	export GNUPGHOME="$(mktemp -d)"; \
-	gpg --batch --keyserver ha.pool.sks-keyservers.net --recv-keys "$key"; \
-	gpg --batch --export "$key" > /etc/apt/trusted.gpg.d/mysql.gpg; \
-	gpgconf --kill all; \
-	rm -rf "$GNUPGHOME"; \
-	apt-key list > /dev/null
+# This image must forever use UID 27 for mysql user so our volumes are
+# safe in the future. This should *never* change, the last test is there
+# to make sure of that.
+RUN yum -y module enable mysql:$MYSQL_VERSION && \
+    INSTALL_PKGS="policycoreutils rsync tar gettext hostname bind-utils groff-base mysql-server" && \
+    yum install -y --setopt=tsflags=nodocs $INSTALL_PKGS && \
+    rpm -V $INSTALL_PKGS && \
+    yum -y clean all --enablerepo='*' && \
+    mkdir -p /var/lib/mysql/data && chown -R mysql.0 /var/lib/mysql && \
+    test "$(id mysql)" = "uid=27(mysql) gid=27(mysql) groups=27(mysql)"
 
-ENV MYSQL_MAJOR 8.0
-ENV MYSQL_VERSION 8.0.24-1debian10
+# Get prefix path and path to scripts rather than hard-code them in scripts
+ENV CONTAINER_SCRIPTS_PATH=/usr/share/container-scripts/mysql \
+    MYSQL_PREFIX=/usr
 
-RUN echo 'deb http://repo.mysql.com/apt/debian/ buster mysql-8.0' > /etc/apt/sources.list.d/mysql.list
+COPY 8.0/root-common /
+COPY 8.0/s2i-common/bin/ $STI_SCRIPTS_PATH
+COPY 8.0/root /
 
-# the "/var/lib/mysql" stuff here is because the mysql-server postinst doesn't have an explicit way to disable the mysql_install_db codepath besides having a database already "configured" (ie, stuff in /var/lib/mysql/mysql)
-# also, we set debconf keys to make APT a little quieter
-RUN { \
-		echo mysql-community-server mysql-community-server/data-dir select ''; \
-		echo mysql-community-server mysql-community-server/root-pass password ''; \
-		echo mysql-community-server mysql-community-server/re-root-pass password ''; \
-		echo mysql-community-server mysql-community-server/remove-test-db select false; \
-	} | debconf-set-selections \
-	&& apt-get update \
-	&& apt-get install -y \
-		mysql-community-client="${MYSQL_VERSION}" \
-		mysql-community-server-core="${MYSQL_VERSION}" \
-	&& rm -rf /var/lib/apt/lists/* \
-	&& rm -rf /var/lib/mysql && mkdir -p /var/lib/mysql /var/run/mysqld \
-	&& chown -R mysql:mysql /var/lib/mysql /var/run/mysqld \
-# ensure that /var/run/mysqld (used for socket and lock files) is writable regardless of the UID our mysqld instance ends up having at runtime
-	&& chmod 1777 /var/run/mysqld /var/lib/mysql
+# this is needed due to issues with squash
+# when this directory gets rm'd by the container-setup
+# script.
+# Also reset permissions of filesystem to default values
+RUN rm -rf /etc/my.cnf.d/* && \
+    /usr/libexec/container-setup && \
+    rpm-file-permissions
 
-VOLUME /var/lib/mysql
+# Not using VOLUME statement since it's not working in OpenShift Online:
+# https://github.com/sclorg/httpd-container/issues/30
+# VOLUME ["/var/lib/mysql/data"]
 
-# Config files
-COPY config/ /etc/mysql/
-COPY docker-entrypoint.sh /usr/local/bin/
-RUN ln -s usr/local/bin/docker-entrypoint.sh /entrypoint.sh # backwards compat
-ENTRYPOINT ["docker-entrypoint.sh"]
+USER 27
 
-EXPOSE 3306 33060
-CMD ["mysqld"]
+ENTRYPOINT ["container-entrypoint"]
+CMD ["run-mysqld"]
